@@ -24,7 +24,6 @@ SIGNALS_TO_NAMES_DICT = dict((getattr(signal, n), n)
 
 SYSLOG_IDENTIFIER = "pcied"
 
-PCIE_RESULT_REGEX = "PCIe Device Checking All Test"
 PCIE_DEVICE_TABLE_NAME = "PCIE_DEVICE"
 PCIE_STATUS_TABLE_NAME = "PCIE_DEVICES"
 PCIE_DETACH_INFO_TABLE = "PCIE_DETACH_INFO"
@@ -94,6 +93,7 @@ class DaemonPcied(daemon_base.DaemonBase):
         self.resultInfo = []
         self.device_name = None
         self.aer_stats = {}
+        self.pcied_cache = {}
 
         global platform_pcieutil
 
@@ -103,10 +103,11 @@ class DaemonPcied(daemon_base.DaemonBase):
 
         # Connect to STATE_DB and create pcie device table
         try:
-            self.state_db = daemon_base.db_connect("STATE_DB")
-            self.device_table = swsscommon.Table(self.state_db, PCIE_DEVICE_TABLE_NAME)
-            self.status_table = swsscommon.Table(self.state_db, PCIE_STATUS_TABLE_NAME)
-            self.detach_info = swsscommon.Table(self.state_db, PCIE_DETACH_INFO_TABLE)
+            state_db = daemon_base.db_connect("STATE_DB")
+            self.redisPipeline = swsscommon.RedisPipeline(state_db,10)
+            self.device_table = swsscommon.Table(self.redisPipeline, PCIE_DEVICE_TABLE_NAME, True)
+            self.status_table = swsscommon.Table(self.redisPipeline, PCIE_STATUS_TABLE_NAME, True)
+            self.detach_info = swsscommon.Table(self.redisPipeline, PCIE_DETACH_INFO_TABLE, True)
         except Exception as e:
             log.log_error("Failed to connect to STATE_DB or create table. Error: {}".format(str(e)), True)
             sys.exit(PCIEUTIL_CONF_FILE_ERROR)
@@ -138,6 +139,7 @@ class DaemonPcied(daemon_base.DaemonBase):
             }
             if aer_fields:
                 self.device_table.set(self.device_name, swsscommon.FieldValuePairs(list(aer_fields.items())))
+                self.pcied_cache[self.device_name]["aer_stats"] = self.aer_stats
             else:
                 self.log_debug("PCIe device {} has no AER attributes".format(self.device_name))
         except Exception as e:
@@ -148,12 +150,31 @@ class DaemonPcied(daemon_base.DaemonBase):
     def check_n_update_pcie_aer_stats(self, Bus, Dev, Fn):
         try:
             self.device_name = "%02x:%02x.%d" % (Bus, Dev, Fn)
-            Id = read_id_file(self.device_name)
+            current_Id = read_id_file(self.device_name)
+            cached_device_data = self.pcied_cache.get(self.device_name, {})
+
+            if current_Id is None:
+               if self.device_name in self.pcied_cache:
+                  del self.pcied_cache[self.device_name]
+               return
+
+            cached_id = cached_device_data.get("device_id", None)
+            id_changed = (cached_id != current_Id)
+            # Check if id changed or adding id for the first time
+            if id_changed:
+               self.device_table.set(self.device_name, swsscommon.FieldValuePairs([('id', current_Id)]))
+               # Ensure cache entry exists
+               if self.device_name not in self.pcied_cache:
+                    self.pcied_cache[self.device_name] = {}
+               self.pcied_cache[self.device_name]["device_id"] = current_Id
+
             self.aer_stats = {}
-            if Id is not None:
-                self.device_table.set(self.device_name, swsscommon.FieldValuePairs([('id', Id)]))
-                self.aer_stats = platform_pcieutil.get_pcie_aer_stats(bus=Bus, dev=Dev, func=Fn)
-                self.update_aer_to_statedb()
+            self.aer_stats = platform_pcieutil.get_pcie_aer_stats(bus=Bus, dev=Dev, func=Fn)
+            cached_aer_stats = cached_device_data.get("aer_stats", None)
+            stats_changed = (cached_aer_stats != self.aer_stats)
+            # Only write to DB if AER stats changed
+            if stats_changed:
+               self.update_aer_to_statedb()
         except Exception as e:
             self.log_error("Exception while checking AER attributes for {}: {}".format(self.device_name, str(e)))
 
@@ -224,6 +245,8 @@ class DaemonPcied(daemon_base.DaemonBase):
 
         # update PCIe Device Status to DB
         self.update_pcie_devices_status_db(err)
+        # flush any remaining requests on the pipeline at end of every cycle
+        self.redisPipeline.flush()
 
    # Override signal handler from DaemonBase
     def signal_handler(self, sig, frame):
