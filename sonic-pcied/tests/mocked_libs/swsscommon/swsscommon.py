@@ -5,10 +5,28 @@
 STATE_DB = ''
 
 
+class RedisPipeline:
+    def __init__(self, db, batch_size=128):
+        self.db = db
+        self.batch_size = batch_size
+        self.queue = []
+
+    def flush(self):
+        # Mock flush operation - just clear the queue
+        self.queue.clear()
+        pass
+
+
 class Table:
-    def __init__(self, db, table_name):
+    def __init__(self, db_or_pipeline, table_name, buffered=False):
+        # Support both old-style (db, table_name) and new-style (pipeline, table_name, buffered)
         self.table_name = table_name
         self.mock_dict = {}
+        self.buffered = buffered
+        if isinstance(db_or_pipeline, RedisPipeline):
+            self.pipeline = db_or_pipeline
+        else:
+            self.pipeline = None
 
     def _del(self, key):
         del self.mock_dict[key]

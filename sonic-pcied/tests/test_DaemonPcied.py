@@ -375,6 +375,8 @@ class TestDaemonPcied(object):
 
         # Case 3: Test when aer_stats has valid data
         daemon_pcied.aer_stats = pcie_aer_stats_no_err
+        # Initialize cache entry for the device to avoid KeyError
+        daemon_pcied.pcied_cache[daemon_pcied.device_name] = mock.MagicMock()
         daemon_pcied.update_aer_to_statedb()
         expected_fields = [
             ("correctable|field1", '0'),
@@ -389,6 +391,7 @@ class TestDaemonPcied(object):
             pcied.swsscommon.FieldValuePairs(expected_fields)
         )
         daemon_pcied.log_debug.assert_not_called()
+        daemon_pcied.log_error.assert_not_called()
         daemon_pcied.device_table.set.reset_mock()
 
         # Case 4: Test exception handling
